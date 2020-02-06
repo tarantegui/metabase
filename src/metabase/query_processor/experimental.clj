@@ -1,12 +1,9 @@
 (ns metabase.query-processor.experimental
+  (:refer-clojure :exclude [reduce])
   (:require [clojure.core.async :as a]
-            [metabase.util :as u]))
+            [metabase.driver :as driver]))
 
-(def test-config
-  {:throw?  true
-   :cancel? false})
-
-(defn driver-execute-query [query respond context]
+(defn driver-execute-query [driver query respond context]
   (if (:throw? test-config)
     (throw (ex-info "Oops!" {}))
     (respond {:cols [{:name "col 1"}
@@ -14,16 +11,117 @@
              [[1 2]
               [3 4]])))
 
-(defn pivot [query xformf {:keys [return], :as context}]
-  {:pre [(fn? return)]}
-  (return query xformf context))
+(defn default-finish [metadata reduced-rows]
+  (-> (assoc metadata :data {:rows reduced-rows
+                             :cols (:cols metadata)})
+      (dissoc :cols)))
+
+(def default-xformf (constantly identity))
+
+(defn default-rff [metadata]
+  (let [row-count (volatile! 0)]
+    (fn
+      ([]
+       [metadata []])
+
+      ([[mta rows]]
+       {:pre [(map? mta)]}
+       [(assoc mta :row_count @row-count)
+        rows])
+
+      ([[mta rows] row]
+       (vswap! row-count inc)
+       [mta (conj rows row)]))))
+
+(defn default-reduce [query xformf {:keys [rff metadata finish raise execute], :as context}]
+  {:pre [(map? query) (fn? xformf) (fn? rff) (fn? metadata) (fn? finish) (fn? raise) (fn? execute)]}
+  (execute
+   (:driver query)
+   query
+   (fn respond* [mta reducible-rows]
+     (let [mta (metadata mta)]
+       (try
+         (let [xform (xformf mta)
+               rf    (rff mta)
+               rf    (xform rf)]
+           (let [reduced-result     (transduce identity rf (rf) reducible-rows)
+                 [mta reduced-rows] reduced-result]
+             (finish mta reduced-rows)))
+         (catch Throwable e
+           (raise e)))))
+   context))
+
+(defn default-context
+  "Default context used to execute a query. You can override these options as needed."
+  []
+  { ;; function used to execute the query. Has the signature. By default, `driver/execute-reducible-query`.
+   ;;
+   ;; (execute-query driver query context respond) -> (respond metadata reducible-rows)
+   :_execute driver/execute-reducible-query
+   :execute  driver-execute-query
+
+   ;; gets/transforms final native query before handing off to driver for execution.
+   ;;
+   ;; (native native-query) -> native-query
+   :native identity
+
+   ;; gets/transforms final preprocessed query before converting to native
+   ;;
+   ;; (preprocessed preprocessed-query) -> preprocessed-query
+   :preprocessed identity
+
+   ;; gets results metadata upon query execution and transforms as needed. (Before it is passed to `xformf`)
+   ;;
+   ;; (metadata results-metadata) -> results-metadata
+   :metadata identity
+
+   ;; combines the results metadata and reduced rows in to the final result returned by the QP.
+   ;;
+   ;; (finish metadata reduced-rows)
+   :finish default-finish
+
+   ;; self-explanatory.
+   ;;
+   ;; (raise exception)
+   :raise identity
+
+   ;; initial value of `xformf` passed to the first middleware.
+   ;;
+   ;; (xformf metadata)
+   :xformf (constantly identity)
+
+   ;; Function used to reduce the reducible rows in query results.
+   ;;
+   ;; (rff metadata) -> rf
+   :rff default-rff
+
+   ;; Function used to perform reduction of results. Called by the last middleware fn. Equivalent to async ring
+   ;; `respond`.
+   ;;
+   ;; (reducef query xformf context) -> (execute driver query respond context)
+   :reduce default-reduce
+
+   ;; sent a message if the query is canceled before finished, e.g. if the connection awaiting results is closed.
+   :canceled-chan (a/promise-chan)})
+
+(defn pivot [query xformf {reducef :reduce, :as context}]
+  {:pre [(fn? reducef)]}
+  (reducef query xformf context))
 
 (defn mbql->native [qp]
-  (fn [query xformf {:keys [preprocessedf nativef], :as context}]
-    (let [query        (cond-> query preprocessedf preprocessedf)
-          native-query (cond-> (assoc query :native? true)
-                         nativef nativef)]
+  (fn [query xformf {:keys [preprocessed native], :as context}]
+    {:pre [(fn? preprocessed) (fn? native)]}
+    (let [query        (preprocessed query)
+          native-query (native (assoc query :native? true))]
       (qp native-query xformf context))))
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                                     EXAMPL                                                     |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+(def test-config
+  {:throw?  false
+   :cancel? false})
 
 (defn example-async-middleware [qp]
   (fn [query xformf {:keys [canceled-chan raise], :as context}]
@@ -44,18 +142,18 @@
 (defn example-context-xform-middleware [qp]
   (fn [query xformf context]
     (qp query xformf (-> (assoc context :extra-key? true)
-                         (update :preprocessedf (fn [preprocessedf]
-                                                  (fn [query]
-                                                    (println "GOT PREPROCESSED QUERY!" query)
-                                                    (preprocessedf query))))))))
+                         (update :preprocessed (fn [preprocessed]
+                                                 (fn [query]
+                                                   (println "GOT PREPROCESSED QUERY!" query)
+                                                   (preprocessed query))))))))
 
 (defn example-metadata-xform-middleware [qp]
   (fn [query xformf context]
-    (qp query xformf (update context :metadataf (fn [metadataf]
-                                                  (fn [metadata]
-                                                    (let [metadata (metadataf metadata)]
-                                                      (update metadata :cols #(for [col %]
-                                                                                (assoc col :fancy? true))))))))))
+    (qp query xformf (update context :metadata (fn [metadata]
+                                                 (fn [mta]
+                                                   (let [mta (metadata mta)]
+                                                     (update mta :cols #(for [col %]
+                                                                          (assoc col :fancy? true))))))))))
 
 (defn example-query-xform-middleware [qp]
   (fn [query xformf context]
@@ -65,17 +163,22 @@
   (fn [query xformf context]
     (qp
      query
-     (fn example-rows-xform-middleware-xformf [metadata]
+     (fn example-rows-xform-middleware-xformf [mta]
+       {:pre [(map? mta)]}
        (comp
         (fn example-rows-xform-middleware-xform [rf]
-          (fn example-rows-xform-middleware-rf
-            ([] (rf))
-            ([acc] (rf acc))
-            ([acc row] (conj acc (conj row :cool)))))
-        (xformf metadata)))
-     (update context :metadataf (fn [metadataf]
-                                  (fn [metadata]
-                                    (metadataf (update metadata :cols conj {:name "Cool col"}))))))))
+          (let [another-row-count (volatile! 0)]
+            (fn example-rows-xform-middleware-rf
+              ([] (rf))
+              ([[mta rows]]
+               (rf [(assoc mta :row_count_2 @another-row-count)
+                    rows]))
+
+              ([acc row]
+               (vswap! another-row-count inc)
+               (rf acc (conj row :cool))))))
+        (xformf mta)))
+     (update context :metadata #(comp % (fn [mta] (update mta :cols conj {:name "Cool col"})))))))
 
 (def pipeline
   (-> pivot
@@ -86,112 +189,42 @@
       example-query-xform-middleware
       example-rows-xform-middleware))
 
-(def default-xformf (constantly identity))
-
-(defn default-respond [metadata reduced-rows]
-  (println "reduced:" reduced-rows)
-  (assoc-in metadata [:data :rows] reduced-rows))
-
-;; context replaces chans.
-(defn default-context []
-  {:canceled-chan (a/promise-chan)
-   ;; formerly these were all channels, replacing them with fns for convenience.
-
-   ;; function used to execute the query. Don't override this without a good reason
-   :executef driver-execute-query
-
-   ;; gets/transforms final native query before handing off to driver for execution
-   :nativef identity
-
-   ;; gets/transforms final preprocessed query before converting to native
-   :preprocessedf identity
-
-   ;; gets results metadata upon query execution and transforms as needed. (Before it is passed to `xformf`)
-   :metadataf identity
-
-   ;; (respond metadata reduced-rows)
-   ;; combines the results metadata and reduced rows in to the final result returned by the QP.
-   :respond default-respond
-
-   ;; self-explanatory.
-   :raise identity
-
-   ;; (continue query xformf context)
-   ;; called by the last middleware fn. Equivalent to async ring `respond`
-   :continue identity})
-
-;; TODO - consider renaming respond + continue to completion + respond or something like that
-;; TODO - should rff and xformf, and "reducef" (transduce) be part of context?
-
-(defn default-rf
-  ([] [])
-  ([acc] acc)
-  ([acc row] (conj acc row)))
-
-(defn default-return [rff]
-  (fn default-return*
-    [query xformf {:keys [metadataf respond raise executef], :as context}]
-    (println "query:" query)                               ; NOCOMMIT
-    (println "xformf:" xformf)                             ; NOCOMMIT
-    (println "context:\n" (u/pprint-to-str 'blue context)) ; NOCOMMIT
-    (executef
-     query
-     (fn respond* [metadata reducible-rows]
-       (let [metadata (cond-> metadata metadataf metadataf)]
-         (println "metadata:" metadata)             ; NOCOMMIT
-         (println "reducible-rows:" reducible-rows) ; NOCOMMIT
-         (try
-           (let [xform (xformf metadata)
-                 rf    (rff metadata)]
-             (println "xform:" xform)     ; NOCOMMIT
-             (println "rf:" rf)           ; NOCOMMIT
-             (respond
-              metadata
-              (transduce identity (xform rf) reducible-rows)))
-           (catch Throwable e
-             (raise e)))))
-     context)))
-
 (defn build-qp* [qp]
   (fn qp*
     ([query]
-     (qp* query (constantly default-rf) default-xformf (default-context)))
+     (qp* query nil))
 
-    ([query rff]
-     (qp* query rff default-xformf (default-context)))
-
-    ([query rff xformf]
-     (qp* query rff xformf (default-context)))
-
-    ([query rff xformf {:keys [canceled-chan respond raise], :as context}]
-     {:pre [(fn? respond) (fn? raise) (some? canceled-chan)]}
-     (let [result-chan (a/promise-chan)
-           respond'    (fn [metadata reduced-rows]
-                         (a/>!! result-chan (respond metadata reduced-rows)))
-           raise'      (fn [e]
-                         (a/>!! result-chan (raise e)))]
-       (a/go
-         (let [[val port] (a/alts! [result-chan canceled-chan] :priority true)]
-           (when (and (= val nil)
-                      (= port result-chan))
-             (a/>! canceled-chan :cancel))
-           (a/close! result-chan)
-           (a/close! canceled-chan)))
-       (qp query xformf (assoc context
-                               :respond respond'
-                               :raise raise'
-                               :return (default-return rff)))
-       result-chan))))
+    ([query context]
+     (let [{:keys [xformf finish raise canceled-chan], :as context} (merge (default-context) context)]
+       (assert (fn? xformf))
+       (assert (fn? finish))
+       (assert (fn? raise))
+       (assert (some? canceled-chan))
+       (let [result-chan (a/promise-chan)
+             finish'     (fn [metadata reduced-rows]
+                           (a/>!! result-chan (finish metadata reduced-rows)))
+             raise'      (fn [e]
+                           (a/>!! result-chan (raise e)))]
+         ;; if `result-chan` gets closed before it gets a result, send a message to `canceled-chan`
+         (a/go
+           (let [[val port] (a/alts! [result-chan canceled-chan] :priority true)]
+             (when (and (= val nil)
+                        (= port result-chan))
+               (a/>! canceled-chan :cancel))
+             (a/close! result-chan)
+             (a/close! canceled-chan)))
+         (qp query xformf (merge context
+                                 {:finish finish'
+                                  :raise  raise'}))
+         result-chan)))))
 
 (def qp (build-qp* pipeline))
 
 (defn- x []
   (let [result-chan (qp {:my-query? true})]
-    (println "result-chan:" result-chan) ; NOCOMMIT
     (when (:cancel? test-config)
       (a/close! result-chan))
     (let [[val] (a/alts!! [result-chan (a/timeout 1000)])]
-      (println "val:" val)              ; NOCOMMIT
       (when (instance? Throwable val)
         (throw val))
       val)))
