@@ -50,28 +50,19 @@
                                   (for [cause causes]
                                     (update cause :stacktrace sequential?)))))))))))
 
+
 (defn- catch-exceptions
-  ([qp]
-   (catch-exceptions qp {}))
+  ([run]
+   (catch-exceptions run {}))
 
-  ([qp query]
-   (mt/with-open-channels [raise-chan    (a/promise-chan)
-                           finished-chan (a/promise-chan)]
-     (catch-exceptions qp query {:raise-chan raise-chan, :finished-chan finished-chan})
-     (mt/wait-for-result finished-chan)))
-
-  ([qp query chans]
-   ((catch-exceptions/catch-exceptions qp)
-    query
-    (constantly identity)
-    chans)))
+  ([run query]
+   (mt/test-qp-middleware catch-exceptions/catch-exceptions query {} [] {:run run})))
 
 (deftest no-exception-test
   (testing "No Exception -- should return response as-is"
     (is (= {}
            (catch-exceptions
-            (fn [query _ {:keys [finished-chan]}]
-              (a/>!! finished-chan query)))))))
+            (fn []))))))
 
 (deftest sync-exception-test
   (testing "if the QP throws an Exception (synchronously), should format the response appropriately"
@@ -86,7 +77,7 @@
            (-> (catch-exceptions (fn [& _] (throw (Exception. "Something went wrong"))))
                (update :stacktrace boolean))))))
 
-(deftest async-exception-test
+#_(deftest async-exception-test
   (testing "if an Exception is returned asynchronously by `raise`, should format it the same way"
     (is (= {:status     :failed
             :class      java.lang.Exception
@@ -96,7 +87,7 @@
             :row_count  0
             :data       {:rows []
                          :cols []}}
-           (-> (catch-exceptions (fn [_ _ {:keys [raise-chan]}] (a/>!! raise-chan (Exception. "Something went wrong"))))
+           (-> (catch-exceptions (fn [_ _ {:keys [raisef]}] (a/>!! raise-chan (Exception. "Something went wrong"))))
                (update :stacktrace boolean))))))
 
 (deftest include-query-execution-info-test

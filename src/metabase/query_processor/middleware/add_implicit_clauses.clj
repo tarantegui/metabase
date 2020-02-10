@@ -145,8 +145,5 @@
   "Add an implicit `fields` clause to queries with no `:aggregation`, `breakout`, or explicit `:fields` clauses.
    Add implicit `:order-by` clauses for fields specified in a `:breakout`."
   [qp]
-  (fn [query xform {:keys [raise-chan], :as chans}]
-    (try
-      (qp (maybe-add-implicit-clauses query) xform chans)
-      (catch Throwable e
-        (a/>!! raise-chan e)))))
+  (fn [query xformf context]
+    (qp (maybe-add-implicit-clauses query) xformf context)))

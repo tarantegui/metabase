@@ -75,33 +75,31 @@
   InterruptedExceptions."
   false)
 
-(defn- runnable ^Runnable [qp query xform {:keys [raise-chan], :as chans}]
+(defn- runnable ^Runnable [qp query xformf {:keys [raisef], :as context}]
   (bound-fn []
     (binding [*already-in-thread-pool?* true]
       (try
-        (qp query xform chans)
+        (qp query xformf context)
         (catch Throwable e
-          (a/>!! raise-chan e))))))
+          (raisef e))))))
 
-(defn- run-in-thread-pool [qp {database-id :database, :as query} xform {:keys [canceled-chan raise-chan], :as chans}]
+(defn- run-in-thread-pool [qp {database-id :database, :as query} xformf {:keys [canceled-chan], :as context}]
   {:pre [(integer? database-id)]}
-  (try
-    (let [pool  (db-thread-pool database-id)
-          futur (.submit pool (runnable qp query xform chans))]
-      (a/go
-        (when (a/<! canceled-chan)
-          (log/debug (trs "Request canceled, canceling pending query"))
-          (future-cancel futur))))
-    (catch Throwable e
-      (a/>!! raise-chan e)))
+  ;; TODO - Look at using Claypoole or Dirgirste thread pools insttead
+  (let [pool  (db-thread-pool database-id)
+        futur (.submit pool (runnable qp query xformf context))]
+    (a/go
+      (when (a/<! canceled-chan)
+        (log/debug (trs "Request canceled, canceling pending query"))
+        (future-cancel futur))))
   nil)
 
 (defn wait-for-turn
   "Middleware that throttles the number of concurrent queries for each connected database, parking the thread until it
   is allowed to run."
   [qp]
-  (fn [query xform chans]
+  (fn [query xformf context]
     {:pre [(map? query)]}
     (if (or *already-in-thread-pool?* *disable-async-wait*)
-      (qp query xform chans)
-      (run-in-thread-pool qp query xform chans))))
+      (qp query xformf context)
+      (run-in-thread-pool qp query xformf context))))

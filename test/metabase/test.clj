@@ -11,7 +11,7 @@
              [query-processor-test :as qp.test]]
             [metabase.driver.sql-jdbc-test :as sql-jdbc-test]
             [metabase.query-processor
-             [build :as qp.build]
+             [reducible :as qp.reducible]
              [test-util :as qp.test-util]]
             [metabase.test
              [data :as data]
@@ -186,36 +186,38 @@
 
 ;; New QP middleware test util fns. Experimental. These will be put somewhere better if confirmed useful.
 
+
+
 (defn test-qp-middleware
   "Helper for testing QP middleware. Changes are returned in a map with keys:
 
     * `:pre`(`query` after preprocessing)
     * `:metadata` (`metadata` after post-processing modification)
     * `:post`(`rows` after post-processing transduction)"
+  ([middleware-fn]
+   (test-qp-middleware middleware-fn {}))
+
   ([middleware-fn query]
    (test-qp-middleware middleware-fn query []))
 
   ([middleware-fn query rows]
    (test-qp-middleware middleware-fn query {} rows))
 
-  ([middleware-fn query metadata rows & [{:keys [chans run]
-                                          :or   {chans {}}}]]
-   (let [qp (middleware-fn
-             (fn [query xformf _]
-               (if run
-                 (run)
-                 (let [xform             (xformf metadata)
-                       rf                (xform (qp.build/default-rff metadata))
-                       [metadata result] (transduce identity rf rows)]
-                   {:pre      query
-                    :metadata metadata
-                    :post     result}))))]
-     (qp
-      query
-      (fn xformf [metadata]
-        (fn xform [rf]
-          (fn rf*
-            ([] (rf))
-            ([result] [metadata (rf result)])
-            ([result row] (rf result row)))))
-      chans))))
+  ([middleware-fn query metadata rows & [{:keys [run], :as context}]]
+   {:pre [(fn? middleware-fn) (map? query) (map? metadata)]}
+   (let [qp      (qp.reducible/sync-qp (qp.reducible/reducible-qp (middleware-fn qp.reducible/pivot)))
+         {:keys [finishf], :as context} (merge (qp.reducible/default-context) context)]
+     (qp query (merge context
+                      {:timeout  500
+                       :executef (fn [_ query _ respond]
+                                   (println "run:" run) ; NOCOMMIT
+                                   (when run (run))
+                                   (respond (assoc metadata :pre query) rows))
+                       :finishf  (fn
+                                   ([result]
+                                    (finishf result))
+                                   ([metadata rows]
+                                    (println "metadata rows:" metadata rows) ; NOCOMMIT
+                                    (finishf {:pre      (:pre metadata)
+                                              :metadata (dissoc metadata :pre :row_count)
+                                              :post     rows})))})))))

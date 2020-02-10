@@ -1,16 +1,15 @@
 (ns metabase.query-processor
   "Preprocessor that does simple transformations to all incoming queries, simplifing the driver-specific
   implementations."
-  (:require [clojure.core.async :as a]
-            [clojure.tools.logging :as log]
+  (:require [clojure.tools.logging :as log]
             [metabase
              [config :as config]
              [driver :as driver]]
             [metabase.driver.util :as driver.u]
             [metabase.mbql.schema :as mbql.s]
             [metabase.query-processor
-             [build :as qp.build]
              [error-type :as error-type]
+             [reducible :as qp.reducible]
              [store :as qp.store]]
             [metabase.query-processor.middleware
              [add-dimension-projections :as add-dim]
@@ -57,52 +56,6 @@
 ;;; |                                                QUERY PROCESSOR                                                 |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-;; Query processor middleware has the signature
-;;
-;;    (defn middleware [qp]
-;;      (fn [query xformf chans]
-;;        (qp query xformf chans)))
-;;
-;; Preprocessing the query can be done in-line by modifying `query`, e.g.:
-;;
-;;    (defn middleware [qp]
-;;      (fn [query xformf {:keys [raise-chan], :as chans}]
-;;        (try
-;;          (qp (modify-query query) xformf chans)
-;;          (catch Throwable e
-;;            (a/>!! raise-chan e)))))
-;;
-;; Post-processing results (i.e., modifying the results metadata or the rows) can be done by applying a composing
-;; transducing functions. `xformf` is called with results metadata before reducing results like:
-;;
-;;    (xformf metadata) -> xform
-;;
-;; You can compose the xforms as follows:
-;;
-;;    (defn my-xform [metadata]
-;;      (fn [rf]
-;;        ([]        (rf))
-;;        ([acc]     (transform-final-result (rf acc)))
-;;        ([acc row] (rf acc (transform-row row)))))
-;;
-;;    (defn middleware [qp]
-;;      (fn [query xformf chans]
-;;        (qp
-;;         query
-;;         (fn [metadata]
-;;           (let [metadata' (transform-metadata metadata)]
-;;             (comp (my-xform metadata') (xformf metadata'))))
-;;         chans)))
-;;
-;; Note that the final reduced result varies depending on which reducing function is used; it is *NOT* safe to assume
-;; results will always be returned in the "normal" map format. Stick to modifying the metadata or rows instead.
-;;
-;; chans are a map of `core.async` channels used for different purposes. For writing most middleware you should only
-;; need `raise-chan` or `canceled-chan`. Instead of throwing Exceptions directly, you should send them to
-;; `raise-chan`, since the query processor is asynchronous, as demonstrated in the example above. `canceled-chan` can
-;; be used to listen for a message if the query is canceled before completion. See
-;; `metabase.query-processor.build/async-chans` for details about the other channels.
-
 ;; ▼▼▼ POST-PROCESSING ▼▼▼  happens from TOP-TO-BOTTOM, e.g. the results of `f` are (eventually) passed to `limit`
 (def default-middleware
   "The default set of middleware applied to queries ran via `process-query`."
@@ -146,24 +99,70 @@
 ;; ▲▲▲ PRE-PROCESSING ▲▲▲ happens from BOTTOM-TO-TOP, e.g. the results of `expand-macros` are passed to
 ;; `substitute-parameters`
 
+(def default-middleware
+  "The default set of middleware applied to queries ran via `process-query`."
+  [#'mbql-to-native/mbql->native
+   ;; TODO ­ implement this, or come up with a new `reducible-query` util fn that can be used in its place.
+   #_#'annotate/result-rows-maps->vectors ; TODO
+   #'check-features/check-features
+   #'optimize-datetime-filters/optimize-datetime-filters
+   #'wrap-value-literals/wrap-value-literals
+   #'annotate/add-column-info
+   #'perms/check-query-permissions
+   #'pre-alias-ags/pre-alias-aggregations
+   #'cumulative-ags/handle-cumulative-aggregations
+   #'resolve-joins/resolve-joins
+   #'add-implicit-joins/add-implicit-joins
+   #'limit/limit
+   #'format-rows/format-rows
+   #'desugar/desugar
+   #'binning/update-binning-strategy
+   #'resolve-fields/resolve-fields
+   #'add-dim/add-remapping
+   #'implicit-clauses/add-implicit-clauses
+   #'add-source-metadata/add-source-metadata-for-source-queries
+   #'reconcile-bucketing/reconcile-breakout-and-order-by-bucketing
+   #'bucket-datetime/auto-bucket-datetimes
+   #'resolve-source-table/resolve-source-tables
+   #'parameters/substitute-parameters
+   #'expand-macros/expand-macros
+   #'add-timezone-info/add-timezone-info
+   #'splice-params-in-response/splice-params-in-response
+   #'resolve-database-and-driver/resolve-database-and-driver
+   #'fetch-source-query/resolve-card-id-source-tables
+   #'store/initialize-store
+   #'async-wait/wait-for-turn
+   #_#'cache/maybe-return-cached-results ; TODO
+   #'validate/validate-query
+   #'normalize/normalize
+   #'add-rows-truncated/add-rows-truncated
+   #'results-metadata/record-and-return-metadata!
+   #'async/count-in-flight-queries])
+
+(defn- combine-middleware [middleware]
+  (reduce
+   (fn [qp middleware]
+     (middleware qp))
+   qp.reducible/pivot
+   middleware))
+
 ;; In REPL-based dev rebuild the QP every time it is called; this way we don't need to reload this namespace when
 ;; middleware is changed. Outside of dev only build the QP once for performance/locality
-(defn- base-qp [& args]
+(defn- base-qp [middleware]
   (letfn [(qp []
-            (apply qp.build/base-query-processor args))]
+            (qp.reducible/reducible-qp (combine-middleware middleware)))]
     (if config/is-dev?
       (fn [& args]
         (apply (qp) args))
       (qp))))
 
-(def ^{:arglists '([query] [query rff])} process-query-async
-  "Process a query asynchronously, returning a handful of `core.async` channels that can be used to get the results (see
-  docstring for `metabase.query-processor.build/async-chans` for more details on what these channels are.)"
-  (qp.build/async-query-processor (base-qp default-middleware)))
+(def ^{:arglists '([query] [query context])} process-query-async
+  "Process a query asynchronously, returning a `core.async` channel that is called with the final result (or Throwable)."
+  (base-qp default-middleware))
 
-(def ^{:arglists '([query] [query rff])} process-query-sync
+(def ^{:arglists '([query] [query context])} process-query-sync
   "Process a query synchronously, blocking until results are returned. Throws raised Exceptions directly."
-  (qp.build/sync-query-processor process-query-async))
+  (qp.reducible/sync-qp process-query-async))
 
 (defn process-query
   "Process an MBQL query. This is the main entrypoint to the magical realm of the Query Processor. Returns a *single*
@@ -171,9 +170,9 @@
   the core.async channel is closed, the query will be canceled."
   {:arglists '([query] [query rff])}
   [{:keys [async?], :as query} & args]
-  (if-not async?
-    (apply process-query-sync query args)
-    (:finished-chan (apply process-query-async query args))))
+  (apply (if async? process-query-async process-query-sync)
+         query
+         args))
 
 (def ^:private ^:dynamic *preprocessing-level* 1)
 
@@ -181,42 +180,18 @@
 
 (def ^:private ^:const preprocessing-timeout-ms 10000)
 
-(def ^:private ^{:arglists '([query])} preprocess-query
-  (let [qp (qp.build/async-query-processor
-            (base-qp
-             (fn [_ _ _ respond]
-               (respond {} []))
-             default-middleware)
-            preprocessing-timeout-ms)]
-    (fn [query]
-      ;; record the number of recursive preprocesses taking place to prevent infinite preprocessing loops.
-      (log/tracef "*preprocessing-level*: %d" *preprocessing-level*)
-      (when (>= *preprocessing-level* max-preprocessing-level)
-        (throw (ex-info (str (tru "Infinite loop detected: recursively preprocessed query {0} times."
-                                  max-preprocessing-level))
-                 {:type error-type/qp})))
-      (binding [*preprocessing-level*           (inc *preprocessing-level*)
-                async-wait/*disable-async-wait* true]
-        (qp query)))))
-
-(defn query->preprocessed
-  "Return the fully preprocessed form for `query`, the way it would look immediately before `mbql->native` is called.
-  Especially helpful for debugging or testing driver QP implementations."
-  {:style/indent 0}
-  [query]
-  (let [{:keys [preprocessed-chan finished-chan]} (preprocess-query query)]
-    ;; cancel the query as soon as we get the preprocessed version
-    (a/go
-      (when-let [preprocessed (a/<! preprocessed-chan)]
-        (a/>! finished-chan {:status :internal, ::preprocessed preprocessed})))
-    (let [result (a/<!! finished-chan)]
-      (when (instance? Throwable result)
-        (throw result))
-      (when (or (not (map? result))
-                (not (::preprocessed result)))
-        (throw (ex-info (tru "Error preprocessing query: unexpected result")
-                 {:type error-type/qp, :result result})))
-      (::preprocessed result))))
+(defn query->preprocessed [query]
+  (binding [*preprocessing-level*           (inc *preprocessing-level*)
+            async-wait/*disable-async-wait* true]
+    ;; record the number of recursive preprocesses taking place to prevent infinite preprocessing loops.
+    (log/tracef "*preprocessing-level*: %d" *preprocessing-level*)
+    (when (>= *preprocessing-level* max-preprocessing-level)
+      (throw (ex-info (str (tru "Infinite loop detected: recursively preprocessed query {0} times."
+                                max-preprocessing-level))
+                      {:type error-type/qp})))
+    (process-query-sync query {:preprocessedf
+                               (fn [query]
+                                 (throw (qp.reducible/quit query)))})))
 
 (defn query->expected-cols
   "Return the `:cols` you would normally see in MBQL query results by preprocessing the query and calling `annotate` on
@@ -240,20 +215,9 @@
   simliar functionality for queries that are actually executed.)"
   {:style/indent 0}
   [query]
-  (perms/check-current-user-has-adhoc-native-query-perms query)
-  (let [{:keys [native-query-chan finished-chan]} (preprocess-query query)]
-    ;; cancel the query as soon as we get the native-query
-    (a/go
-      (when-let [native-query (a/<! native-query-chan)]
-        (a/>! finished-chan {:status :internal, ::native native-query})))
-    (let [result (a/<!! finished-chan)]
-      (when (instance? Throwable result)
-        (throw result))
-      (when (or (not (map? result))
-                (not (::native result)))
-        (throw (ex-info (tru "Error converting query to native: unexpected result")
-                 {:type error-type/qp, :result result})))
-      (::native result))))
+  (process-query-sync query {:nativef
+                             (fn [query]
+                               (throw (qp.reducible/quit query)))}))
 
 (defn query->native-with-spliced-params
   "Return the native form for a `query`, with any prepared statement (or equivalent) parameters spliced into the query
@@ -285,21 +249,21 @@
     #'process-userland-query/process-userland-query
     #'catch-exceptions/catch-exceptions]))
 
-(def ^{:arglists '([query] [query rff])} process-userland-query-async
+(def ^{:arglists '([query] [query context])} process-userland-query-async
   "Like `process-query-async`, but for 'userland' queries (e.g., queries ran via the REST API). Adds extra middleware."
-  (qp.build/async-query-processor (base-qp userland-middleware)))
+  (base-qp userland-middleware))
 
-(def ^{:arglists '([query] [query rff])} process-userland-query-sync
+(def ^{:arglists '([query] [query context])} process-userland-query-sync
   "Like `process-query-sync`, but for 'userland' queries (e.g., queries ran via the REST API). Adds extra middleware."
-  (qp.build/sync-query-processor process-userland-query-async))
+  (qp.reducible/sync-qp process-userland-query-sync))
 
 (defn process-userland-query
   "Like `process-query`, but for 'userland' queries (e.g., queries ran via the REST API). Adds extra middleware."
-  {:arglists '([query] [query rff])}
+  {:arglists '([query] [query context])}
   [{:keys [async?], :as query} & args]
-  (if-not async?
-    (apply process-userland-query-sync query args)
-    (:finished-chan (apply process-userland-query-async query args))))
+  (apply (if async? process-userland-query-async process-userland-query-sync)
+         query
+         args))
 
 (s/defn process-query-and-save-execution!
   "Process and run a 'userland' MBQL query (e.g. one ran as the result of an API call, scheduled Pulse, MetaBot query,

@@ -42,9 +42,6 @@
   "Middleware that will take any `:source-table`s (integer IDs) anywhere in the query and fetch and save the
   corresponding Table in the Query Processor Store."
   [qp]
-  (fn [query xform {:keys [raise-chan], :as chans}]
-    (try
-      (resolve-source-tables* query)
-      (qp query xform chans)
-      (catch Throwable e
-        (a/>!! raise-chan e)))))
+  (fn [query xformf context]
+    (resolve-source-tables* query)
+    (qp query xformf context)))

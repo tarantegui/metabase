@@ -28,9 +28,5 @@
   queries without `:params` (which will be all of them for drivers that don't support the equivalent of prepared
   statement parameters, like Druid), this middleware does nothing."
   [qp]
-  (fn [query xformf chans]
-    (qp
-     query
-     (fn [metadata]
-       (xformf (splice-params-in-metadata metadata)))
-     chans)))
+  (fn [query xformf {:keys [metadataf], :as context}]
+    (qp query xformf (assoc context :metadataf (comp metadataf splice-params-in-metadata)))))

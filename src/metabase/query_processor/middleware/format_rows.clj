@@ -67,8 +67,9 @@
       ([]
        (xf))
 
-      ([result]
-       (xf result))
+      ([[metadata rows]]
+       {:pre [(map? metadata)]} ; NOCOMMIT
+       (xf [metadata rows]))
 
       ([result row]
        (xf result (mapv #(format-value % timezone-id) row))))))
@@ -76,11 +77,10 @@
 (defn format-rows
   "Format individual query result values as needed.  Ex: format temporal values as ISO-8601 strings w/ timezone offset."
   [qp]
-  (fn [{{:keys [format-rows?] :or {format-rows? true}} :middleware, :as query} xformf chans]
-    (qp
-     query
-     (if format-rows?
-       (fn [metadata]
-         (comp format-rows-xform (xformf metadata)))
-       xformf)
-     chans)))
+  (fn [{{:keys [format-rows?] :or {format-rows? true}} :middleware, :as query} xformf context]
+    (qp query
+        (if format-rows?
+          (fn [metadata]
+            (comp format-rows-xform (xformf metadata)))
+          xformf)
+        context)))

@@ -50,8 +50,8 @@
   (sql-jdbc.execute/execute-query driver query))
 
 (defmethod driver/execute-reducible-query :sql-jdbc
-  [driver query chans respond]
-  (sql-jdbc.execute/execute-reducible-query driver query chans respond))
+  [driver query context respond]
+  (sql-jdbc.execute/execute-reducible-query driver query context respond))
 
 (defmethod driver/notify-database-updated :sql-jdbc
   [_ database]

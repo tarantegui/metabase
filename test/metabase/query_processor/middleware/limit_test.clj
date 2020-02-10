@@ -2,12 +2,12 @@
   "Tests for the `:limit` clause and `:max-results` constraints."
   (:require [clojure.test :refer :all]
             [metabase.query-processor
-             [build :as qp.build]
+             #_[build :as qp.build]
              [interface :as i]]
             [metabase.query-processor.middleware.limit :as limit]))
 
 (defn- limit [query]
-  ((qp.build/sync-query-processor
+  #_((qp.build/sync-query-processor
     (qp.build/async-query-processor
      (qp.build/base-query-processor
       (fn [_ query _ return-results]

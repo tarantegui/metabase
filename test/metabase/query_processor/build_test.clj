@@ -7,22 +7,23 @@
             [clojure.core.async :as a]
             [clojure.java.io :as io]
             [metabase
+             [driver :as driver]
              [query-processor :as qp]
              [test :as mt]]
-            [metabase.query-processor.build :as qp.build]
+            [metabase.query-processor.reducible :as qp.reducible]
             [metabase.util.files :as u.files]))
 
 (defn- print-rows-rff [metadata]
   (fn
-    ([] 0)
+    ([] [metadata 0])
 
-    ([row-count]
+    ([acc]
      (flush)
-     row-count)
+     acc)
 
-    ([row-count row]
+    ([[metadata row-count] row]
      (printf "ROW %d -> %s\n" (inc row-count) (pr-str row))
-     (inc row-count))))
+     [metadata (inc row-count)])))
 
 (deftest print-rows-test
   (testing "An example of using a reducing function that prints rows as they come in."
@@ -33,7 +34,7 @@
                                        {:database (mt/id)
                                         :type     :query
                                         :query    {:source-table (mt/id :venues), :limit 3}}
-                                       print-rows-rff))))]
+                                       {:rff print-rows-rff}))))]
       (is (= 3
              @qp-result))
       (is (= ["ROW 1 -> [1 \"Red Medicine\" 4 10.0646 -165.374 3]"
@@ -41,26 +42,27 @@
               "ROW 3 -> [3 \"The Apple Pan\" 11 34.0406 -118.428 2]"]
              output)))))
 
-(defn- print-rows-to-writer-rff [filename]
-  (qp.build/decorated-reducing-fn
-   (fn [reduce-with-rff]
-     (try
-       (locking println (println (format "<Opening writer to %s>" (pr-str filename))))
-       (with-open [w (io/writer filename)]
-         (reduce-with-rff
-          (fn [metadata]
-            (fn
-              ([] 0)
+(defn print-rows-to-writer-reducef [filename]
+  (fn reducef* [query xformf {:keys [executef], :as context}]
+    (letfn [(respond [metadata reducible-rows]
+              (with-open [w (io/writer filename)]
+                (println (format "<Opening writer to %s>" (pr-str filename)))
+                (try
+                  (letfn [(rff [metadata]
+                            (fn
+                              ([] [metadata 0])
 
-              ([row-count]
-               (.flush w)
-               {:rows row-count})
+                              ([[metadata row-count]]
+                               (.flush w)
+                               [metadata row-count])
 
-              ([row-count row]
-               (.write w (format "ROW %d -> %s\n" (inc row-count) (pr-str row)))
-               (inc row-count))))))
-       (finally
-         (locking println (println (format "<Closed writer to %s>" (pr-str filename)))))))))
+                              ([[metadata row-count] row]
+                               (.write w (format "ROW %d -> %s\n" (inc row-count) (pr-str row)))
+                               [metadata (inc row-count)])))]
+                    (qp.reducible/transduce-rows xformf (assoc context :rff rff) metadata reducible-rows))
+                  (finally
+                    (println (format "<Closed writer to %s>" (pr-str filename)))))))]
+      (executef driver/*driver* query context respond))))
 
 (deftest write-rows-to-file-test
   (let [filename (str (u.files/get-path (System/getProperty "java.io.tmpdir") "out.txt"))]
@@ -69,7 +71,8 @@
                 {:database (mt/id)
                  :type     :query
                  :query    {:source-table (mt/id :venues), :limit 3}}
-                (print-rows-to-writer-rff filename))
+                {:reducef (print-rows-to-writer-reducef filename)})
+               :data
                (select-keys [:rows]))))
     (is (= ["ROW 1 -> [1 \"Red Medicine\" 4 10.0646 -165.374 3]"
             "ROW 2 -> [2 \"Stout Burgers & Beers\" 11 34.0996 -118.329 2]"
@@ -79,12 +82,12 @@
 (defn- maps-rff [metadata]
   (let [ks (mapv (comp keyword :name) (:cols metadata))]
     (fn
-      ([] [])
+      ([] [metadata []])
 
-      ([acc] {:data (merge metadata {:rows acc})})
+      ([acc] acc)
 
-      ([acc row]
-       (conj acc (zipmap ks row))))))
+      ([[metadata rows] row]
+       [metadata (conj rows (zipmap ks row))]))))
 
 (deftest maps-test
   (testing "Example using an alternative reducing function that returns rows as a sequence of maps."
@@ -95,42 +98,48 @@
               {:database (mt/id)
                :type     :query
                :query    {:source-table (mt/id :venues), :limit 2, :order-by [[:asc (mt/id :venues :id)]]}}
-              maps-rff))))))
+              {:rff maps-rff}))))))
 
+;; TODO - fix me
 (deftest cancelation-test
   (testing "Example of canceling a query early before results are returned."
-    (letfn [(process-query []
-              (qp/process-query-async
-               {:database (mt/id)
-                :type     :native
-                :native   {:query "SELECT * FROM users ORDER BY id ASC LIMIT 5;"}}
-               (fn [metadata]
-                 (Thread/sleep 1000)
-                 (qp.build/default-rff metadata))))]
-      (let [{:keys [canceled-chan finished-chan]} (process-query)]
-        (a/put! canceled-chan :cancel)
-        (is (= {:status :interrupted}
-               (a/<!! finished-chan))))
-      (let [{:keys [finished-chan]} (process-query)]
-        (future
-          (Thread/sleep 50)
-          (a/close! finished-chan))
-        (is (= nil
-               (a/<!! finished-chan))))))
-
-  (testing "With a ridiculous timeout (1 ms) we should still get a result"
-    (let [qp (qp.build/sync-query-processor
-              (qp.build/async-query-processor
-               (qp.build/base-query-processor
-                (fn [_ _ _ respond]
-                  (Thread/sleep 10)
-                  (respond {} []))
-                nil)
-               1))]
-      (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo
-           #"Timed out after 1000\.0 µs\."
-           (qp {}))))))
+    (letfn [(process-query [canceled-chan timeout]
+              ((qp.reducible/reducible-qp (fn [query xformf {:keys [canceled-chan reducef], :as context}]
+                                            (let [futur (future (reducef query xformf context))]
+                                              (a/go
+                                                (when (a/<! canceled-chan)
+                                                  (future-cancel futur))))))
+               {}
+               {:canceled-chan canceled-chan
+                :timeout       timeout
+                :executef      (fn [_ _ _ respond]
+                                 (Thread/sleep 500)
+                                 (respond {} [[1]]))}))]
+      (mt/with-open-channels [canceled-chan (a/promise-chan)]
+        (let [out-chan (process-query canceled-chan 1000)]
+          (println "close out-chan:" out-chan) ; NOCOMMIT
+          (a/close! out-chan)
+          (is (= :cancel
+                 (first (a/alts!! [canceled-chan (a/timeout 500)]))))))
+      (mt/with-open-channels [canceled-chan (a/promise-chan)]
+        (let [out-chan (process-query canceled-chan 1000)]
+          (future
+            (Thread/sleep 50)
+            (a/close! out-chan))
+          (is (= :cancel
+                 (a/<!! canceled-chan)))
+          (is (= nil
+                 (a/<!! out-chan)))))
+      (testing "With a ridiculous timeout (1 ms) we should still get a result"
+        (mt/with-open-channels [canceled-chan (a/promise-chan)]
+          (let [out-chan (process-query canceled-chan 1)
+                result (first (a/alts!! [out-chan (a/timeout 1000)]))]
+            (is (thrown-with-msg?
+                 clojure.lang.ExceptionInfo
+                 #"Timed out after 1000\.0 µs\."
+                 (if (instance? Throwable result)
+                   (throw result)
+                   result)))))))))
 
 (deftest exceptions-test
   (testing "Test a query that throws an Exception."
@@ -147,19 +156,16 @@
           {:database (mt/id)
            :type     :query
            :query    {:source-table (mt/id :venues), :limit 20}}
-          (qp.build/decorated-reducing-fn
-           (fn [_]
-             (throw (Exception. "Cannot open file")))))))))
+          {:reducef (fn [& _]
+                      (throw (Exception. "Cannot open file")))})))))
 
 (deftest custom-qp-test
   (testing "Rows don't actually have to be reducible. And you can build your own QP with your own middleware."
     (is (= {:data {:cols [{:name "n"}]
                    :rows [{:n 1} {:n 2} {:n 3} {:n 4} {:n 5}]}}
-           ((qp.build/sync-query-processor
-             (qp.build/async-query-processor
-              (qp.build/base-query-processor
-               (fn [_ _ _ results-fn]
-                 (results-fn {:cols [{:name "n"}]} [[1] [2] [3] [4] [5]]))
-               [])))
+           ((qp.reducible/sync-qp (qp.reducible/reducible-qp qp.reducible/pivot))
             {}
-            maps-rff)))))
+            {:executef (fn [_ _ _ respond]
+                         (respond {:cols [{:name "n"}]}
+                                  [[1] [2] [3] [4] [5]]))
+             :rff      maps-rff})))))

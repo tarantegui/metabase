@@ -26,5 +26,5 @@
         (driver/with-driver driver
           (mt/with-database-timezone-id nil
             (is (= expected
-                   (-> (mt/test-qp-middleware add-timezone-info/add-timezone-info nil nil nil)
+                   (-> (mt/test-qp-middleware add-timezone-info/add-timezone-info)
                        :metadata)))))))))

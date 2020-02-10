@@ -504,13 +504,16 @@
 (defn add-column-info
   "Middleware for adding type information about the columns in the query results (the `:cols` key)."
   [qp]
-  (fn [{query-type :type, :as query} xformf chans]
-    (qp
-     query
-     (fn [metadata]
-       (if (= query-type :query)
-         (xformf (assoc metadata :cols (column-info* query metadata)))
-         ;; rows sampling is only needed for native queries! TODO ­ not sure we really even need to do for native
-         ;; queries...
-         (comp (add-column-info-xform query metadata) (xformf metadata))))
-     chans)))
+  (fn [{query-type :type, :as query} xformf {:keys [metadataf], :as context}]
+    (qp query
+        ;; rows sampling is only needed for native queries! TODO ­ not sure we really even need to do for native
+        ;; queries...
+        (if (= query-type :native)
+          (fn [metadata]
+            (comp (add-column-info-xform query metadata) (xformf metadata)))
+          xformf)
+        ;; for mbql queries we can add metadata directly in the `metadataf`
+        (if (= query-type :query)
+          (assoc context :metadataf (fn [metadata]
+                                      (metadataf (assoc metadata :cols (column-info* query metadata)))))
+          context))))

@@ -2,8 +2,7 @@
   "Middleware related to doing extra steps for queries that are ran via API endpoints (i.e., most of them -- as opposed
   to queries ran internally e.g. as part of the sync process). These include things like saving QueryExecutions and
   formatting the results."
-  (:require [clojure.core.async :as a]
-            [clojure.tools.logging :as log]
+  (:require [clojure.tools.logging :as log]
             [java-time :as t]
             [metabase.models
              [query :as query]
@@ -93,18 +92,18 @@
     ;; TODO - we should test for this
     (if cached?
       rf
-      (let [result-rows (volatile! 0)]
+      (let [row-count (volatile! 0)]
         (fn
           ([]
            (rf))
 
-          ([result]
-           (save-successful-query-execution-async! execution-info @result-rows)
-           (rf (cond->> result
-                 (map? result) (success-response execution-info))))
+          ([[metadata rows]]
+           (save-successful-query-execution-async! execution-info @row-count)
+           (rf [(success-response metadata execution-info)
+                rows]))
 
           ([result row]
-           (vswap! result-rows inc)
+           (vswap! row-count inc)
            (rf result row)))))))
 
 (defn- query-execution-info
@@ -134,16 +133,17 @@
   "Do extra handling 'userland' queries (i.e. ones ran as a result of a user action, e.g. an API call, scheduled Pulse,
   etc.). This includes recording QueryExecution entries and returning the results in an FE-client-friendly format."
   [qp]
-  (fn [query xformf {:keys [query-execution-chan raise-chan], :as chans}]
-    (let [query'         (assoc-in query [:info :query-hash] (qputil/query-hash query))
-          execution-info (query-execution-info query')]
-      (some-> query-execution-chan (a/>!! execution-info))
-      ;; saxve failure QueryExecutions if we get an Exception
-      (a/go
-        (when-let [^Throwable e (a/<! raise-chan)]
-          (save-failed-query-execution-async! execution-info (.getMessage e))))
-      (qp
-       query'
-       (fn [metadata]
-         (comp (add-and-save-execution-info-xform! metadata execution-info) (xformf metadata)))
-       chans))))
+  (fn [query xformf {:keys [raisef], :as context}]
+    (let [query          (assoc-in query [:info :query-hash] (qputil/query-hash query))
+          execution-info (query-execution-info query)]
+      (letfn [(xformf* [metadata]
+                (comp (add-and-save-execution-info-xform! metadata execution-info) (xformf metadata)))
+              (raisef* [e]
+                (save-failed-query-execution-async! execution-info (.getMessage e))
+                (raisef (ex-info (.getMessage e)
+                                 {:query-execution execution-info}
+                                 e)))]
+        (try
+          (qp query xformf* (assoc context :raisef raisef*))
+          (catch Throwable e
+            (raisef* e)))))))

@@ -11,7 +11,6 @@
             [metabase.util
              [encryption :as encryption]
              [i18n :refer [tru]]]
-            [redux.core :as redux]
             [ring.util.codec :as codec]
             [toucan.db :as db]))
 
@@ -104,25 +103,36 @@
       (log/error e (tru "Error recording results metadata for query")))))
 
 (defn- insights-xform [orig-metadata record!]
-  (fn insights-rf [rf]
-    (redux/post-complete
-     (redux/juxt rf (analyze.results/insights-rf orig-metadata))
-     (fn [[result {:keys [metadata insights]}]]
-       (record! metadata)
-       (if-not (map? result)
-         result
-         (update result :data #(assoc %
-                                      :results_metadata {:checksum (metadata-checksum metadata)
-                                                         :columns  metadata}
-                                      :insights insights)))))))
+  (fn insights-rf* [rf]
+    (let [irf     (analyze.results/insights-rf orig-metadata)
+          irf-acc (volatile! nil)]
+      (fn
+        ([]
+         (vreset! irf-acc (irf))
+         (rf))
+
+        ([[metadata acc]]
+         {:pre [(map? metadata)]}
+         (rf [(update metadata :data merge (let [{:keys [metadata insights]} (irf @irf-acc)]
+                                             {:results_metadata {:checksum (metadata-checksum metadata)
+                                                                 :columns  metadata}
+                                              :insights         insights}))
+              acc]))
+
+        ([acc row]
+         (vswap! irf-acc (fn [irf-acc]
+                           (if (reduced? irf-acc)
+                             irf-acc
+                             (irf irf-acc row))))
+         (rf acc row))))))
 
 (defn record-and-return-metadata!
   "Middleware that records metadata about the columns returned when running the query."
   [qp]
-  (fn [{{:keys [skip-results-metadata?]} :middleware, :as query} xformf chans]
+  (fn [{{:keys [skip-results-metadata?]} :middleware, :as query} xformf context]
     (if skip-results-metadata?
-      (qp query xformf chans)
+      (qp query xformf context)
       (let [record! (partial record-metadata! query)
             xformf' (fn [metadata]
                       (comp (insights-xform metadata record!) (xformf metadata)))]
-        (qp query xformf' chans)))))
+        (qp query xformf' context)))))
